@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fsmore · 飞书本地 AI 工作台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">飞</div>
+        <div class="brand-text">
+          <h1>fsmore</h1>
+          <p>飞书本地 AI 工作台</p>
+        </div>
+        <button id="sidebarToggle" class="sidebar-toggle" type="button" title="收起侧栏">«</button>
+      </div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="docs" title="飞书文档"><span class="nav-icon">📄</span><span class="nav-label">飞书文档</span></button>
+        <button class="nav-item" data-view="mcp" title="AI 接入 (MCP)"><span class="nav-icon">🔌</span><span class="nav-label">AI 接入 (MCP)</span></button>
+        <button class="nav-item" data-view="settings" title="设置"><span class="nav-icon">⚙️</span><span class="nav-label">设置</span></button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div id="statusCard" class="status-card">
+          <div class="status-line"><span id="statusDot" class="dot dot-gray"></span><span id="statusText">加载中…</span></div>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <!-- 飞书文档：左侧目录 + 右侧内容（默认双栏，无文档源时留空） -->
+      <section id="view-docs" class="view active full">
+        <div id="docsWorkspace" class="docs-workspace">
+          <aside class="docs-left">
+            <form id="addRootForm" class="add-root-form">
+              <input id="addRootInput" type="text" autocomplete="off"
+                     placeholder="粘贴链接或 Node Token" />
+              <button type="submit" class="btn btn-primary btn-small">添加</button>
+            </form>
+            <div class="docs-left-section">
+              <span class="section-label">文档源</span>
+              <span class="section-actions">
+                <button id="btnDiscover" class="btn-link" type="button">发现知识库</button>
+                <button id="btnSyncAll" class="btn-link" type="button">同步全部</button>
+              </span>
+            </div>
+            <div class="doc-search">
+              <span class="doc-search-icon">🔍</span>
+              <input id="docSearchInput" type="text" autocomplete="off" placeholder="搜索文档标题" />
+              <button id="docSearchClear" class="doc-search-clear hidden" type="button" title="清空搜索">✕</button>
+            </div>
+            <div id="tree" class="tree-pane"></div>
+          </aside>
+
+          <section class="docs-right">
+            <div id="docViewerEmpty" class="doc-viewer-empty">
+              <div class="doc-viewer-empty-icon">📄</div>
+              <p>在左侧选择一篇文档，这里显示内容</p>
+              <p class="hint">未同步的文档会在点击时自动拉取</p>
+            </div>
+            <div id="docViewer" class="doc-viewer hidden">
+              <div class="doc-viewer-head">
+                <div class="doc-viewer-title">
+                  <h3 id="viewerTitle"></h3>
+                  <div id="viewerMeta" class="preview-meta"></div>
+                </div>
+                <div id="viewerActions" class="doc-viewer-actions"></div>
+              </div>
+              <iframe id="viewerFrame" class="viewer-frame" sandbox="allow-scripts" title="文档内容"></iframe>
+            <textarea id="viewerEditor" class="viewer-editor hidden" spellcheck="false" wrap="off"></textarea>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- MCP -->
+      <section id="view-mcp" class="view">
+        <header class="view-header">
+          <div>
+            <h2>AI 接入 (MCP)</h2>
+            <p class="view-desc">任何支持 MCP 的 AI（Claude / Codex / Cursor / ZCode…）都可以通过下面的端点随时搜索、读取、按需同步飞书文档。</p>
+          </div>
+        </header>
+
+        <div class="card">
+          <div class="endpoint-row">
+            <span class="endpoint-label">MCP 端点（Streamable HTTP）</span>
+            <code id="mcpEndpoint" class="endpoint-url"></code>
+            <button id="btnCopyEndpoint" class="btn btn-small">复制</button>
+          </div>
+          <div class="endpoint-row workspace-row">
+            <span class="endpoint-label">本地工作区（AI 可直接读 .md）</span>
+            <code id="workspacePath" class="endpoint-url"></code>
+            <button id="btnCopyWorkspace" class="btn btn-small">复制</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>客户端接入配置</h3>
+          <div class="snippet-tabs" id="snippetTabs">
+            <button class="tab active" data-snippet="generic">通用 JSON</button>
+            <button class="tab" data-snippet="claude">Claude Code</button>
+            <button class="tab" data-snippet="codex">Codex CLI</button>
+            <button class="tab" data-snippet="zcode">ZCode</button>
+          </div>
+          <pre class="snippet" id="snippetBox"></pre>
+          <div class="snippet-actions"><button id="btnCopySnippet" class="btn btn-small">复制配置</button></div>
+        </div>
+
+        <div class="card">
+          <h3>MCP 工具清单</h3>
+          <table class="table">
+            <thead><tr><th style="width:180px">工具</th><th>说明</th></tr></thead>
+            <tbody id="mcpToolsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 设置 -->
+      <section id="view-settings" class="view">
+        <header class="view-header">
+          <div>
+            <h2>设置</h2>
+            <p class="view-desc">四步完成接入：创建应用 → 填写凭证 → 放行回调地址 → 飞书扫码授权。凭证只保存在本机 data/config.json，不会上传。</p>
+          </div>
+        </header>
+
+        <!-- 连接状态横幅 -->
+        <div id="authBanner" class="auth-banner gray">
+          <div class="auth-banner-main">
+            <span id="authBannerDot" class="dot dot-white"></span>
+            <div>
+              <h3 id="authBannerTitle">尚未配置</h3>
+              <p id="authBannerDesc">先在下方填写应用凭证，再完成扫码授权，即可同步你有权限的全部飞书文档。</p>
+            </div>
+          </div>
+          <div id="authBannerMeta" class="auth-banner-side"></div>
+        </div>
+
+        <div class="settings-grid">
+          <div class="card step-card">
+            <div class="step-head"><span class="step-num">1</span><h3>创建飞书应用并开通权限</h3></div>
+            <p class="hint">在 <a href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建「企业自建应用」，进入「权限管理」开通以下权限，然后「版本管理与发布」发布版本：</p>
+            <ul class="scope-list" id="scopeList">
+              <li><code data-scope="docx:document">docx:document</code> — 读取与编辑文档</li>
+              <li><code data-scope="docx:document.block:convert">docx:document.block:convert</code> — Markdown 转换</li>
+              <li><code data-scope="wiki:wiki:readonly">wiki:wiki:readonly</code> — 读取知识库</li>
+              <li><code data-scope="drive:drive:readonly">drive:drive:readonly</code> — 读取云空间与图片</li>
+              <li><code data-scope="board:whiteboard:node:read">board:whiteboard:node:read</code> — 读取画板</li>
+              <li><code data-scope="board:whiteboard:node:create">board:whiteboard:node:create</code> — 编辑画板</li>
+            </ul>
+            <div class="scope-copy-row">
+              <button id="btnCopyScopes" class="btn btn-small" type="button">⧉ 一键复制全部权限</button>
+            </div>
+          </div>
+
+          <div class="card step-card">
+            <div class="step-head"><span class="step-num">2</span><h3>填写应用凭证</h3></div>
+            <form id="configForm" class="config-form">
+              <label>App ID
+                <input id="cfgAppId" type="text" autocomplete="off" placeholder="cli_xxxxxxxxxxxx" />
+              </label>
+              <label>App Secret
+                <div class="input-with-action">
+                  <input id="cfgAppSecret" type="password" autocomplete="off" placeholder="请输入 App Secret" />
+                  <button type="button" id="btnToggleSecret" class="btn btn-small" title="显示 / 隐藏密钥">显示密钥</button>
+                </div>
+              </label>
+              <label>同步并发数（1-8）
+                <input id="cfgConcurrency" type="number" min="1" max="8" />
+              </label>
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary">保存凭证</button>
+                <button type="button" id="btnTestConn" class="btn">测试凭证有效性</button>
+              </div>
+            </form>
+            <div id="connResult" class="conn-result"></div>
+          </div>
+
+          <div class="card step-card callout-card">
+            <div class="step-head"><span class="step-num">3</span><h3>飞书「安全设置」放行回调地址</h3></div>
+            <p class="hint">扫码前必须先放行本机回调地址，否则飞书授权页会提示「redirect_uri 不合法」：</p>
+            <div class="redirect-chip">
+              <code id="redirectUri">http://127.0.0.1:7788/api/oauth/callback</code>
+              <button id="btnCopyRedirect" class="btn btn-small" type="button">复制</button>
+            </div>
+            <ol class="mini-steps">
+              <li>打开<a href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a>，进入你的应用</li>
+              <li>左侧「开发配置」→「安全设置」→「重定向 URL」</li>
+              <li>粘贴上方地址并保存，然后进行第 4 步扫码</li>
+            </ol>
+          </div>
+
+          <div class="card step-card">
+            <div class="step-head"><span class="step-num">4</span><h3>飞书扫码授权</h3></div>
+            <p class="hint">保存凭证后扫码授权：授权后 fsmore 以<b>你本人的身份</b>访问飞书（读取与推送均以你的权限为准），令牌自动续期。</p>
+            <button id="btnOAuth" class="btn btn-primary btn-oauth" type="button">
+              <span class="oauth-icon">📱</span> 打开飞书扫码授权
+            </button>
+            <div id="authStateLine" class="auth-state-line"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>运行信息</h3>
+          <div id="runtimeInfo" class="kv-grid"></div>
+        </div>
+
+        <div class="card">
+          <h3>缓存管理</h3>
+          <p class="hint">清理本地 <code>.maomi</code> 文档缓存（已同步 markdown、回写基线、IR / 原始 JSON）。清理后所有文档回到未同步状态，重新同步即可从飞书恢复；<b style="color:var(--amber)">未推送到飞书的本地修改将一并丢失</b>。不影响应用凭证与文档源配置。</p>
+          <div id="cacheInfo" class="kv-grid"></div>
+          <div class="form-actions">
+            <button id="btnClearCache" class="btn btn-danger" type="button">清空缓存</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 通用确认弹窗（替代原生 confirm） -->
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-dialog confirm-dialog">
+      <div id="confirmText" class="confirm-text"></div>
+      <div class="confirm-actions">
+        <button id="confirmCancel" class="btn" type="button">取消</button>
+        <button id="confirmOk" class="btn btn-primary" type="button">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 发现知识库弹窗 -->
+  <div id="discoverModal" class="modal hidden">
+    <div class="modal-dialog discover-dialog">
+      <div class="modal-head">
+        <div>
+          <h3>发现知识库</h3>
+        </div>
+        <button id="discoverClose" class="job-close" title="关闭">✕</button>
+      </div>
+      <div id="discoverModalList" class="discover-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- 任务进度浮窗 -->
+  <div id="jobPanel" class="job-panel hidden">
+    <div class="job-head">
+      <span id="jobLabel" class="job-label">同步中…</span>
+      <button id="jobClose" class="job-close" title="关闭">✕</button>
+    </div>
+    <div class="progress"><div id="jobBar" class="progress-bar"></div></div>
+    <div id="jobStats" class="job-stats"></div>
+    <pre id="jobLog" class="job-log"></pre>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+
+  <script src="/vendor/marked.min.js"></script>
+  <script src="/vendor/highlight.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

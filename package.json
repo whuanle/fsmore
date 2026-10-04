@@ -1,0 +1,55 @@
+{
+  "name": "@whuanle/fsmore",
+  "version": "0.1.0",
+  "description": "飞书本地 AI 工作台：飞书文档同步为本地 Markdown + Web 可视化管理 + MCP 服务",
+  "keywords": [
+    "feishu",
+    "lark",
+    "markdown",
+    "mcp",
+    "ai-workbench"
+  ],
+  "license": "MIT",
+  "author": "whuanle",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whuanle/fsmore.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whuanle/fsmore/issues"
+  },
+  "homepage": "https://github.com/whuanle/fsmore#readme",
+  "type": "module",
+  "bin": {
+    "fsmore": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src/web"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "express": "^4.21.2",
+    "marked": "^15.0.6",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
