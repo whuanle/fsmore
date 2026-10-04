@@ -10,15 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write # npm Trusted Publisher（OIDC）免 token 发布所需
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # node 24 自带 npm ≥ 11.5：Trusted Publisher 要求的最低 npm 版本
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org/
+          node-version: 24
           cache: npm
 
       # 防呆：tag 必须与 package.json 版本一致（推荐用 npm version patch/minor/major 自动同步两者）
@@ -43,7 +44,7 @@ jobs:
       - name: Build
         run: npm run build
 
+      # 认证走 npm Trusted Publisher（OIDC）：仓库/工作流已在 npmjs.com 登记，
+      # 无需 NPM_TOKEN；登记的 workflow 文件名须为 publish.yml
       - name: Publish to npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
