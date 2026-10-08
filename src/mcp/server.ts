@@ -9,7 +9,7 @@ import { downloadAsset } from "../feishu/assets.js";
 import { describeFeishuError } from "../feishu/errors.js";
 import type { JobManager } from "../jobs.js";
 import { SyncEngine } from "../workspace/sync.js";
-import { searchDocs } from "../workspace/search.js";
+import { searchDocs, resolveDocLocations } from "../workspace/search.js";
 import { assetDirAbsolute, mdAbsolutePath, type NodeEntry, type WorkspaceStore } from "../workspace/store.js";
 import { WORKSPACE_DIR } from "../paths.js";
 import type { AppConfig } from "../config.js";
@@ -36,8 +36,11 @@ export function createMcpServer(services: McpServices): McpServer {
     version: "0.1.0",
   }, {
     instructions: [
-      "fsmore 是飞书本地 AI 工作台：飞书文档已被同步为本机 markdown 文件（front matter 里含 feishu_token / source_url / revision_id 元信息）。",
-      "推荐工作流：先用 search_docs 或 list_docs 找到相关文档 → 用 read_doc 读取 markdown → 若内容可能过期（需要最新版）再调用 sync_doc 后重新读取。",
+      "fsmore 是飞书本地 AI 工作台：飞书文档可同步为本机 markdown 文件（front matter 里含 feishu_token / source_url / revision_id 元信息）。",
+      "推荐工作流：先用 search_online 在飞书云端搜索（不限已同步范围，auto_pull 默认把命中文档自动拉取到本地）→ 用 read_doc 读取 markdown；只知道标题/主题时优先 search_online。",
+      "浏览结构用 get_tree（目录树，可从任意 token 位置展开）；已知一批 token/标题要拿本地路径时用 resolve_docs 一次批量解析。",
+      "新建文档用 create_doc（建完编辑本地 .md 再 push_doc）；把整个知识库/文件夹接入工作台用 add_root + sync_space。",
+      "search_docs / list_docs 只覆盖本地已同步的文档；若目标文档可能未同步，用 search_online 或 sync_doc 拉取后再读。",
       "修改飞书文档：直接编辑本地 .md 文件，然后调用 push_doc 回写飞书。同步的 markdown 保留飞书原生标签（<image>/<callout>/<table> 等），回写时按 MaomiAgent 四级策略无损还原；远端有新改动时会提示冲突，确认覆盖可传 force=true。",
       "文档内的图片等资源已下载到本地工作区，read_doc 返回的 markdown 里是相对路径；需要绝对路径或下载附件时用 list_assets / fetch_asset。回写时图片/附件会以文字占位，不会丢失本地文件。",
       "所有路径若不明确说明，均相对于 markdown 工作区根目录（list_spaces 返回 workspace_path）。",
@@ -111,11 +114,196 @@ export function createMcpServer(services: McpServices): McpServer {
     }
   });
 
+  // ---------- get_tree ----------
+
+  server.registerTool("get_tree", {
+    title: "获取目录树",
+    description: "获取飞书文档的层级目录树：不传参数返回全部文档源顶层，传 space_id 限定某个文档源，传 token 从指定节点位置展开子树。默认 depth=3 层、未列出的节点自动向远端拉取一层；返回每个节点的标题/类型/是否已同步/本地路径。",
+    inputSchema: {
+      token: z.string().optional().describe("从该节点展开子树（节点 token 或 doc_id）"),
+      space_id: z.string().optional().describe("限定某个文档源（list_spaces 返回的 space_id）；与 token 二选一"),
+      depth: z.number().int().min(1).max(10).optional().describe("展开层数，默认 3（大空间建议小深度分页取）"),
+      list_remote: z.boolean().optional().describe("未列出的节点是否自动向飞书拉取一层，默认 true；false 则只用本地索引"),
+    },
+  }, async ({ token, space_id: spaceId, depth, list_remote: listRemote }) => {
+    try {
+      const result = await services.engine.getTree({ token, spaceId, depth, listRemote });
+      return text(JSON.stringify({
+        ...result,
+        note: result.truncated
+          ? `节点数超过上限，已截断：可传 token 从未展开的位置分层获取`
+          : "has_child=true 但无 children 的节点可用 token 继续向下展开",
+      }, null, 2));
+    } catch (error) {
+      return fail(error);
+    }
+  });
+
+  // ---------- resolve_docs ----------
+
+  server.registerTool("resolve_docs", {
+    title: "批量解析文档位置",
+    description: "批量获取文档的本地位置：传一组节点 token（或 feishu_doc_id）精确反查，或传一组标题模糊匹配，返回每篇的本地 md 路径与同步状态。只查本地索引，不发网络请求；未同步的会提示后续动作。",
+    inputSchema: {
+      tokens: z.array(z.string()).max(50).optional().describe("节点 token 或 feishu_doc_id 列表（精确反查）"),
+      titles: z.array(z.string()).max(20).optional().describe("文档标题列表（模糊匹配，返回候选）"),
+    },
+  }, async ({ tokens, titles }) => {
+    try {
+      if (!tokens?.length && !titles?.length) {
+        return fail(new Error("tokens 与 titles 至少传一个"));
+      }
+      const results = resolveDocLocations(services.store, { tokens, titles });
+      const found = results.filter((item) => item.found).length;
+      return text(JSON.stringify({
+        requested: results.length,
+        found,
+        results,
+      }, null, 2));
+    } catch (error) {
+      return fail(error);
+    }
+  });
+
+  // ---------- create_doc ----------
+
+  server.registerTool("create_doc", {
+    title: "新建飞书文档",
+    description: "在飞书新建一篇空 docx 文档并同步到本地，返回本地路径。不传 parent_token 建在「我的空间」；传云空间文件夹 token 或 wiki 节点 token 则建到对应位置（wiki 需要写权限 wiki:wiki）。之后直接编辑本地 .md 再 push_doc 回写。",
+    inputSchema: {
+      title: z.string().min(1).describe("文档标题"),
+      parent_token: z.string().optional().describe("父位置 token：云空间文件夹（get_tree 里的 folder 节点）或 wiki 节点/知识库根；不传建在「我的空间」"),
+    },
+  }, async ({ title, parent_token: parentToken }) => {
+    try {
+      const result = await services.engine.createDoc({ title, parentToken });
+      return text(JSON.stringify({
+        ...result,
+        note: "已创建并同步为本地 markdown：编辑该文件后用 push_doc（token 或 path）回写飞书",
+      }, null, 2));
+    } catch (error) {
+      return fail(error);
+    }
+  });
+
+  // ---------- add_root ----------
+
+  server.registerTool("add_root", {
+    title: "添加文档源",
+    description: "把一个飞书知识库节点 / 云空间文件夹 / 单篇文档添加为工作台文档源（粘贴链接或裸 token），并自动列出其目录树。之后可用 sync_space 批量同步其下全部文档。",
+    inputSchema: {
+      link_or_token: z.string().min(1).describe("飞书链接或 token（wiki 节点 / 文件夹 / 文档）"),
+      list: z.boolean().optional().describe("是否立即列出目录树（写入索引），默认 true"),
+    },
+  }, async ({ link_or_token: linkOrToken, list }) => {
+    try {
+      const { rootId, root } = await services.engine.addRoot(linkOrToken);
+      let listed = 0;
+      if (list !== false) {
+        listed = await services.engine.ensureTreeListed({
+          rootId,
+          startToken: root!.token,
+          kind: root!.kind,
+          spaceId: root!.spaceId,
+          domain: root!.domain,
+        });
+      }
+      return text(JSON.stringify({
+        root_id: rootId,
+        space_id: rootId,
+        kind: root!.kind,
+        title: root!.title,
+        nodes_listed: listed,
+        note: "已添加为文档源；用 sync_space（space_id=root_id）批量同步其下文档，或 get_tree 浏览结构",
+      }, null, 2));
+    } catch (error) {
+      return fail(error);
+    }
+  });
+
+  // ---------- search_online ----------
+
+  server.registerTool("search_online", {
+    title: "在线搜索飞书文档",
+    description: "在飞书云端搜索文档（范围 = 授权用户可见的全部云文档与知识库，不限于已添加/已同步的文档源），搜索到后可自动拉取到本地。返回标题/摘要/所有者/更新时间与本地路径。找不知道 token 的文档时首选。",
+    inputSchema: {
+      query: z.string().min(1).describe("搜索关键词（飞书云端全文匹配，最长 30 字符）"),
+      limit: z.number().int().min(1).max(20).optional().describe("返回条数上限，默认 10（飞书单页最多 20）"),
+      page_token: z.string().optional().describe("翻页标记（上一页 has_more=true 时返回）"),
+      sort: z.enum(["relevance", "edited", "created", "opened"]).optional().describe("排序：relevance 相关度（默认）/ edited 最近编辑 / created 创建时间 / opened 最近打开"),
+      auto_pull: z.boolean().optional().describe("自动把未同步的可同步结果拉取到本地，默认 true"),
+      pull_limit: z.number().int().min(1).max(20).optional().describe("自动拉取的最大篇数，默认 5（按命中顺序跳过已同步）"),
+    },
+  }, async ({ query, limit, page_token: pageToken, sort, auto_pull: autoPull, pull_limit: pullLimit }) => {
+    try {
+      const result = await services.engine.searchOnline({
+        query,
+        pageSize: limit ?? 10,
+        pageToken,
+        sort,
+      });
+      const hits = result.hits.map((hit) => {
+        const node = services.store.getNode(hit.token);
+        return {
+          ...hit,
+          synced: !!node?.mdPath,
+          md_path: node?.mdPath,
+        };
+      });
+
+      const pulled: Array<{ title: string; token: string; md_path?: string; skipped?: boolean; error?: string }> = [];
+      if (autoPull !== false) {
+        let budget = pullLimit ?? 5;
+        for (const hit of result.hits) {
+          if (budget <= 0) {
+            break;
+          }
+          if (!hit.syncable || hits.find((item) => item.token === hit.token)?.synced) {
+            continue;
+          }
+          try {
+            const syncResult = await services.engine.pullOnlineDoc({
+              token: hit.token,
+              entityType: hit.entity_type,
+              url: hit.url,
+              title: hit.title,
+            });
+            const annotated = hits.find((item) => item.token === hit.token);
+            if (annotated) {
+              annotated.synced = true;
+              annotated.md_path = syncResult.mdPath;
+            }
+            pulled.push({
+              title: hit.title,
+              token: hit.token,
+              md_path: syncResult.mdPath,
+              skipped: syncResult.skipped,
+            });
+          } catch (error) {
+            pulled.push({ title: hit.title, token: hit.token, error: describeFeishuError(error) });
+          }
+          budget -= 1;
+        }
+      }
+
+      return text(JSON.stringify({
+        total: result.total,
+        has_more: result.has_more,
+        page_token: result.page_token,
+        note: "docx 文档与 wiki 节点已可读取（read_doc 用返回的 md_path 或 token）；sheet/bitable 等类型暂不支持同步",
+        hits,
+        pulled,
+      }, null, 2));
+    } catch (error) {
+      return fail(error);
+    }
+  });
+
   // ---------- search_docs ----------
 
   server.registerTool("search_docs", {
-    title: "搜索文档",
-    description: "在本地已同步的飞书文档 markdown 全文中做关键词搜索，返回得分排序的命中（含摘要片段）。",
+    title: "搜索本地文档",
+    description: "在本地已同步的飞书文档 markdown 全文中做关键词搜索，返回得分排序的命中（含摘要片段）。只覆盖本地：要搜索飞书云端（含未同步文档）请用 search_online。",
     inputSchema: {
       query: z.string().min(1).describe("搜索关键词（支持中文）"),
       limit: z.number().int().min(1).max(50).optional().describe("返回条数上限，默认 20"),

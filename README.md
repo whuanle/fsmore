@@ -33,7 +33,9 @@ fsmore
    | `docx:document` | 读取与编辑文档 |
    | `docx:document.block:convert` | Markdown 与文档块互转 |
    | `wiki:wiki:readonly` | 读取知识库 |
+   | `wiki:wiki` | 在知识库节点下新建文档 |
    | `drive:drive:readonly` | 读取云空间与图片附件 |
+   | `search:docs:read` | 在线搜索云文档（搜索在线文档并自动拉取） |
    | `board:whiteboard:node:read` | 读取画板 |
    | `board:whiteboard:node:create` | 画板回写 |
 
@@ -68,7 +70,7 @@ claude mcp add --transport http fsmore http://127.0.0.1:7788/mcp
 url = "http://127.0.0.1:7788/mcp"
 ```
 
-常用工具：`search_docs` / `read_doc` 搜索与读取文档，`sync_doc` / `sync_space` 按需拉取最新版，`list_assets` / `fetch_asset` 获取图片附件，`push_doc` 把本地修改回写飞书（完整清单见 Web 控制台「MCP 接入」页）。也可以不用 MCP，直接让 AI 读取工作区目录下的 `.md` 文件。
+常用工具：`search_online` 在飞书云端搜索文档（不限已同步范围，命中后自动拉取到本地），`get_tree` 获取目录树（可从任意节点展开），`resolve_docs` 批量解析 token/标题到本地路径，`create_doc` 新建飞书文档，`add_root` 添加文档源，`search_docs` / `read_doc` 搜索与读取本地文档，`sync_doc` / `sync_space` 按需拉取最新版，`list_assets` / `fetch_asset` 获取图片附件，`push_doc` 把本地修改回写飞书（完整清单见 Web 控制台「MCP 接入」页）。也可以不用 MCP，直接让 AI 读取工作区目录下的 `.md` 文件。
 
 ## 数据与配置
 

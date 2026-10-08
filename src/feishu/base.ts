@@ -18,7 +18,9 @@ export function feishuOAuthScope(): string {
     "docx:document",
     "docx:document.block:convert",
     "wiki:wiki:readonly",
+    "wiki:wiki",
     "drive:drive:readonly",
+    "search:docs:read",
     "board:whiteboard:node:read",
     "board:whiteboard:node:create",
   ].join(" ");

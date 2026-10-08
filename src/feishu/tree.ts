@@ -6,7 +6,7 @@ import { FEISHU_API_BASE } from "./base.js";
  * 扩展：飞书云空间 drive 文件夹树、wiki 空间顶层节点、链接解析）。
  */
 
-export type RootKind = "wiki_space" | "wiki_node" | "folder" | "doc";
+export type RootKind = "wiki_space" | "wiki_node" | "folder" | "doc" | "search";
 
 export type RecognizedRoot = {
   kind: RootKind;
@@ -67,6 +67,8 @@ type FeishuDocumentResponse = {
 
 const DOCX_OBJ_TYPES = new Set(["doc", "docx"]);
 const OTHER_OBJ_TYPES = new Set(["sheet", "bitable", "mindnote", "file", "slides", "board", "mindnote"]);
+/** 供同步管线复用的 docx 类型判定 */
+export const SYNCABLE_OBJ_TYPES: ReadonlySet<string> = DOCX_OBJ_TYPES;
 const WIKI_FALLBACK_ERRORS = ["230027", "not found", "not_found", "bad request", "field validation", "wrong kind", "wrong-kind"];
 
 export function openApiUrl(path: string, params: Record<string, string | number | boolean | undefined | null> = {}): string {
@@ -107,6 +109,36 @@ export function parseFeishuLink(input: string): { token: string; kindGuess?: "wi
     return { token: bare, kindGuess: "folder" };
   }
   return { token: bare, kindGuess: "doc" };
+}
+
+/** 解析 wiki 节点：node_token → 真实文档 id（obj_token）/ 所属空间。找不到或无权限时返回 null。 */
+export async function resolveWikiNode(
+  client: FeishuOpenApiClient,
+  accessToken: string,
+  token: string,
+): Promise<{ nodeToken: string; objToken?: string; objType?: string; spaceId?: string; title?: string } | null> {
+  try {
+    const response = await client.getJson<WikiGetNodeResponse>(
+      openApiUrl("/wiki/v2/spaces/get_node", { token }),
+      accessToken,
+    );
+    const node = response.node ?? {};
+    if (!node.node_token && !node.token) {
+      return null;
+    }
+    return {
+      nodeToken: node.node_token || node.token || token,
+      objToken: node.obj_token || undefined,
+      objType: node.obj_type,
+      spaceId: node.space_id,
+      title: node.title,
+    };
+  } catch (error) {
+    if (shouldFallbackToDocument(error)) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 /** 识别一个根：wiki 节点 → 云空间文件夹 → 普通文档 */
@@ -204,7 +236,7 @@ export async function listChildren(
   accessToken: string,
   input: { kind: RootKind; token: string; spaceId?: string; domain?: string },
 ): Promise<RemoteNode[]> {
-  if (input.kind === "doc") {
+  if (input.kind === "doc" || input.kind === "search") {
     return [];
   }
 

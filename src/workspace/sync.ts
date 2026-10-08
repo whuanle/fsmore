@@ -6,7 +6,8 @@ import type { FeishuOpenApiClient } from "../feishu/client.js";
 import type { FeishuTokenManager } from "../feishu/client.js";
 import { fetchAllBlocks, fetchDocumentIR, fetchDocumentMeta } from "../feishu/doc-reader.js";
 import { downloadAsset } from "../feishu/assets.js";
-import { listChildren, recognizeRoot, type RootKind } from "../feishu/tree.js";
+import { listChildren, openApiUrl, recognizeRoot, resolveWikiNode, buildRemoteUrl, SYNCABLE_OBJ_TYPES, type RemoteNode, type RootKind } from "../feishu/tree.js";
+import { searchOnlineDocs, type OnlineSearchResult, type OnlineSearchSort } from "../feishu/search.js";
 import { describeFeishuError } from "../feishu/errors.js";
 import { FEISHU_MARKDOWN_RENDER_VERSION, feishuDocIRToSourceMarkdown } from "../feishu/markdown.js";
 import { updateWhiteboardWithMermaid } from "../feishu/whiteboard.js";
@@ -56,6 +57,33 @@ export type SyncDocResult = {
   revisionId: string;
 };
 
+/** 「在线搜索」虚拟文档源：搜索命中后拉取的文档都挂在它下面（固定 id，避免重复创建） */
+export const ONLINE_SEARCH_ROOT_ID = "online-search";
+
+/** 「新建文档」虚拟文档源：create_doc 建在「我的空间」（无归属文档源）的文档挂在这里 */
+export const CREATED_DOCS_ROOT_ID = "created-docs";
+
+/** get_tree 单次返回的节点数上限（防大知识库撑爆 AI 上下文；截断时 truncated=true，可换 token 分段取） */
+export const TREE_VIEW_NODE_LIMIT = 500;
+
+/** 目录树节点视图（get_tree 返回结构） */
+export type TreeNodeView = {
+  token: string;
+  kind: "space" | "wiki" | "folder" | "doc" | "other";
+  title: string;
+  obj_type?: string;
+  has_child: boolean;
+  doc_id?: string;
+  url?: string;
+  synced: boolean;
+  md_path?: string;
+  sync_error?: string;
+  children_listed: boolean;
+  /** 列子树失败时的错误信息（该节点作为叶子返回） */
+  list_error?: string;
+  children?: TreeNodeView[];
+};
+
 export class SyncEngine {
   constructor(
     private readonly getConfig: () => AppConfig,
@@ -95,23 +123,8 @@ export class SyncEngine {
           domain: current.domain,
         }));
       listed += 1;
-
+      this.upsertRemoteChildren(input.rootId, current.token, children);
       for (const child of children) {
-        const prev = this.store.getNode(child.token);
-        this.store.upsertNode({
-          token: child.token,
-          kind: child.kind === "wiki" ? "wiki" : child.kind,
-          rootId: input.rootId,
-          parentToken: current.token,
-          title: child.title,
-          objType: child.objType ?? prev?.objType,
-          hasChild: child.hasChild || child.kind === "folder",
-          docId: child.docId ?? prev?.docId,
-          remoteUrl: child.remoteUrl ?? prev?.remoteUrl,
-          mdPath: prev?.mdPath,
-          revisionId: prev?.revisionId,
-          syncedAt: prev?.syncedAt,
-        });
         if (child.hasChild || child.kind === "folder") {
           queue.push({
             token: child.token,
@@ -133,6 +146,151 @@ export class SyncEngine {
 
     this.store.save();
     return listed;
+  }
+
+  /** 远端子节点写入索引（保留原有同步状态），ensureTreeListed 与按层列树共用 */
+  private upsertRemoteChildren(rootId: string, parentToken: string, children: RemoteNode[]): void {
+    for (const child of children) {
+      const prev = this.store.getNode(child.token);
+      this.store.upsertNode({
+        token: child.token,
+        kind: child.kind === "wiki" ? "wiki" : child.kind,
+        rootId,
+        parentToken,
+        title: child.title,
+        objType: child.objType ?? prev?.objType,
+        hasChild: child.hasChild || child.kind === "folder",
+        docId: child.docId ?? prev?.docId,
+        remoteUrl: child.remoteUrl ?? prev?.remoteUrl,
+        mdPath: prev?.mdPath,
+        revisionId: prev?.revisionId,
+        syncedAt: prev?.syncedAt,
+      });
+    }
+  }
+
+  /**
+   * 列出一个节点的直接子节点：缓存优先，未列出过时向远端拉取一次并写入索引。
+   * 返回列出的子节点数（缓存命中返回 0）。
+   */
+  async ensureChildrenListed(token: string): Promise<number> {
+    const node = this.store.getNode(token);
+    if (!node) {
+      throw new Error(`索引中不存在节点：${token}（可用 list_spaces 查看文档源，或 get_tree 从头展开）`);
+    }
+    if (node.childrenListedAt || !canHaveChildren(node)) {
+      return 0;
+    }
+    const root = this.store.getRoot(node.rootId);
+    if (!root) {
+      throw new Error(`节点所属文档源已被删除：${token}`);
+    }
+    const isRoot = root.token === token;
+    const kind: RootKind = node.kind === "folder" ? "folder" : isRoot ? root.kind : "wiki_node";
+    const children = await this.tokens.withToken((accessToken) =>
+      listChildren(this.client, accessToken, {
+        kind,
+        token,
+        spaceId: root.spaceId,
+        domain: root.domain,
+      }));
+    this.upsertRemoteChildren(root.id, token, children);
+    node.childrenListedAt = new Date().toISOString();
+    this.store.save();
+    return children.length;
+  }
+
+  // ---------- 目录树视图（MCP get_tree） ----------
+
+  /**
+   * 获取目录树：不传参数返回全部文档源顶层，传 space_id 限定某个文档源，
+   * 传 token 从指定节点位置展开。默认 depth=3、未列出的节点自动向远端拉取一层。
+   */
+  async getTree(input: { token?: string; spaceId?: string; depth?: number; listRemote?: boolean } = {}): Promise<{ truncated: boolean; nodes: TreeNodeView[] }> {
+    const depth = Math.max(1, Math.min(10, Math.floor(input.depth ?? 3)));
+    const listRemote = input.listRemote !== false;
+
+    let starts: NodeEntry[];
+    if (input.token) {
+      const node = this.store.getNode(input.token) ?? this.findByDocId(input.token);
+      if (!node) {
+        throw new Error(`索引中不存在节点：${input.token}（用 list_spaces 查看文档源，或不带参数 get_tree 返回全部文档源顶层）`);
+      }
+      starts = [node];
+    } else if (input.spaceId) {
+      const root = this.store.getRoot(input.spaceId);
+      const rootNode = root ? this.store.getNode(root.token) : undefined;
+      if (!rootNode) {
+        throw new Error(`文档源不存在：${input.spaceId}（用 list_spaces 查看已添加的文档源）`);
+      }
+      starts = [rootNode];
+    } else {
+      starts = this.store.roots
+        .map((root) => this.store.getNode(root.token))
+        .filter((node): node is NodeEntry => !!node);
+    }
+
+    let emitted = 0;
+    let truncated = false;
+    const build = async (node: NodeEntry, level: number): Promise<TreeNodeView> => {
+      emitted += 1;
+      const view: TreeNodeView = {
+        token: node.token,
+        kind: node.kind,
+        title: node.title,
+        obj_type: node.objType,
+        has_child: canHaveChildren(node),
+        doc_id: node.docId,
+        url: node.remoteUrl,
+        synced: !!node.mdPath,
+        md_path: node.mdPath,
+        sync_error: node.syncError,
+        children_listed: !!node.childrenListedAt,
+      };
+      if (level >= depth || !canHaveChildren(node)) {
+        return view;
+      }
+      if (listRemote && !node.childrenListedAt) {
+        try {
+          await this.ensureChildrenListed(node.token);
+          view.children_listed = true;
+        } catch (error) {
+          // 列子树失败不中断整棵树：该节点作为叶子返回并携带错误
+          view.list_error = describeFeishuError(error);
+          return view;
+        }
+      }
+      if (!node.childrenListedAt) {
+        // 本地未列出且不拉远端：子级未知，作为叶子返回（children 为空数组会误读成空文件夹）
+        return view;
+      }
+      const children = this.store.childrenOf(node.token)
+        .sort((a, b) => a.title.localeCompare(b.title, "zh"));
+      view.children = [];
+      for (const child of children) {
+        if (emitted >= TREE_VIEW_NODE_LIMIT) {
+          truncated = true;
+          break;
+        }
+        view.children.push(await build(child, level + 1));
+      }
+      return view;
+    };
+
+    const nodes: TreeNodeView[] = [];
+    for (const start of starts) {
+      if (emitted >= TREE_VIEW_NODE_LIMIT) {
+        truncated = true;
+        break;
+      }
+      nodes.push(await build(start, 1));
+    }
+    return { truncated, nodes };
+  }
+
+  /** token 反查：先按节点 token，再按内容 doc_id 兜底 */
+  private findByDocId(tokenOrDocId: string): NodeEntry | undefined {
+    return Object.values(this.store.nodes).find((node) => node.docId === tokenOrDocId);
   }
 
   // ---------- 单文档同步 ----------
@@ -458,13 +616,7 @@ export class SyncEngine {
     options: { force?: boolean } = {},
   ): Promise<{ strategy: string; revisionId?: string; blockCount?: number; changedWhiteboards?: number }> {
     // 权限预检：scope 按词精确匹配（飞书可能同时授予 docx:document 与其只读子集，两者并存时编辑有效）
-    const grantedScopes = new Set((this.getConfig().userToken?.scope ?? "").split(/\s+/));
-    if (!grantedScopes.has("docx:document")) {
-      throw new Error(
-        "推送失败：当前扫码授权缺少编辑权限 docx:document。\n"
-        + "请到「设置 → 步骤 4 飞书扫码授权」重新扫码，授权会自动申请编辑权限。",
-      );
-    }
+    this.requireScope("docx:document", "推送文档");
 
     const node = this.store.getNode(token);
     if (!node) {
@@ -656,6 +808,257 @@ export class SyncEngine {
       }
     });
     await Promise.all(runners);
+  }
+
+  // ---------- 在线搜索 ----------
+
+  /**
+   * 飞书云端搜索文档（搜索范围 = 当前授权用户可见的全部云文档与知识库，不限于已添加的文档源）。
+   * 缺少 search:docs:read 权限时给出可操作的提示。
+   */
+  async searchOnline(input: { query: string; pageSize?: number; pageToken?: string; sort?: OnlineSearchSort }): Promise<OnlineSearchResult> {
+    try {
+      return await this.tokens.withToken((accessToken) =>
+        searchOnlineDocs(this.client, accessToken, input));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/scope|permission|denied|无权限|999916/i.test(message)) {
+        throw new Error(
+          `在线搜索失败：缺少「搜索云文档」权限（search:docs:read）。`
+          + `请在飞书开放平台为应用开通该权限并发布版本，然后到「设置」页重新扫码授权。原始错误：${message}`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /** 确保虚拟文档源存在（幂等）：kind 固定 "search"（不向远端列树），返回其 rootId */
+  private ensureVirtualRoot(id: string, title: string): string {
+    const existing = this.store.roots.find((root) => root.id === id);
+    if (existing) {
+      return existing.id;
+    }
+    this.store.addRoot({
+      id,
+      kind: "search",
+      token: id,
+      title,
+      addedAt: new Date().toISOString(),
+    });
+    // 根节点登记为已列出（childrenListedAt），同步/刷新任务不会尝试向远端列它的子树
+    this.store.upsertNode({
+      token: id,
+      kind: "space",
+      rootId: id,
+      parentToken: null,
+      title,
+      hasChild: true,
+      childrenListedAt: new Date().toISOString(),
+    });
+    this.store.save();
+    return id;
+  }
+
+  /**
+   * 新建飞书文档并同步到本地：
+   * - parent_token 是 wiki 节点/知识库根 → POST /wiki/v2/spaces/:space_id/nodes（obj_type=docx，需 wiki:wiki 写权限）
+   * - parent_token 是云空间文件夹 → POST /docx/v1/documents?folder_token=…
+   * - 不传 → 建在「我的空间」根目录
+   * 建完注册进索引（有归属挂归属文档源，否则挂「新建文档」虚拟根）并 syncDoc 拉回本地空文档。
+   */
+  async createDoc(input: { title: string; parentToken?: string }): Promise<SyncDocResult & { url?: string; rootId: string }> {
+    const title = input.title.trim();
+    if (!title) {
+      throw new Error("文档标题不能为空");
+    }
+
+    let docId = "";
+    let nodeToken = "";
+    let url: string | undefined;
+    let rootId: string | undefined;
+    let parentForNode: string | null = null;
+
+    const parentToken = input.parentToken?.trim();
+    if (parentToken) {
+      const known = this.store.getNode(parentToken);
+      if (known && (known.kind === "doc" || known.kind === "other")) {
+        throw new Error("parent_token 应为文件夹或 wiki 节点 token，不能是文档 token");
+      }
+      const root = known ? this.store.getRoot(known.rootId) : undefined;
+      const resolved = await this.tokens.withToken((accessToken) =>
+        resolveWikiNode(this.client, accessToken, parentToken));
+      const wikiByRoot = !resolved
+        && (root?.kind === "wiki_space" || root?.kind === "wiki_node" || known?.kind === "wiki" || known?.kind === "space");
+      const knownRootId = known?.rootId;
+
+      if (resolved || wikiByRoot) {
+        // ---------- 知识库节点下创建 ----------
+        this.requireScope("wiki:wiki", "在知识库节点下新建文档");
+        const spaceId = resolved?.spaceId ?? root?.spaceId;
+        if (!spaceId) {
+          throw new Error("无法确定该 wiki 节点所属的知识库空间（space_id 缺失）");
+        }
+        const parentNodeToken = known
+          ? (root && root.token === known.token ? undefined : known.token)
+          : resolved?.nodeToken;
+        const response = await this.tokens.withToken((accessToken) =>
+          this.client.postJson<{ node?: { node_token?: string; obj_token?: string; title?: string; obj_type?: string } }>(
+            openApiUrl(`/wiki/v2/spaces/${encodeURIComponent(spaceId)}/nodes`),
+            accessToken,
+            {
+              obj_type: "docx",
+              title,
+              parent_node_token: parentNodeToken || undefined,
+            },
+          ));
+        const node = response.node ?? {};
+        if (!node.obj_token || !node.node_token) {
+          throw new Error("飞书创建知识库节点响应缺少 obj_token/node_token");
+        }
+        docId = node.obj_token;
+        nodeToken = node.node_token;
+        url = buildRemoteUrl(undefined, "wiki", nodeToken);
+        rootId = knownRootId;
+        parentForNode = known ? known.token : null;
+        if (!rootId) {
+          rootId = this.ensureVirtualRoot(CREATED_DOCS_ROOT_ID, "新建文档");
+          parentForNode = CREATED_DOCS_ROOT_ID;
+        } else if (parentForNode === null) {
+          parentForNode = this.store.getRoot(rootId)?.token ?? null;
+        }
+      } else {
+        // ---------- 云空间文件夹下创建 ----------
+        const created = await this.createDriveDoc(title, parentToken);
+        docId = created.docId;
+        nodeToken = created.docId;
+        url = created.url;
+        if (knownRootId && known) {
+          rootId = knownRootId;
+          parentForNode = known.token;
+        } else {
+          rootId = this.ensureVirtualRoot(CREATED_DOCS_ROOT_ID, "新建文档");
+          parentForNode = CREATED_DOCS_ROOT_ID;
+        }
+      }
+    } else {
+      // ---------- 我的空间根目录 ----------
+      const created = await this.createDriveDoc(title);
+      docId = created.docId;
+      nodeToken = created.docId;
+      url = created.url;
+      rootId = this.ensureVirtualRoot(CREATED_DOCS_ROOT_ID, "新建文档");
+      parentForNode = CREATED_DOCS_ROOT_ID;
+    }
+
+    this.store.upsertNode({
+      token: nodeToken,
+      kind: "doc",
+      rootId,
+      parentToken: parentForNode,
+      title,
+      objType: "docx",
+      hasChild: false,
+      docId,
+      remoteUrl: url,
+    });
+    this.store.save();
+
+    const result = await this.syncDoc(nodeToken);
+    return { ...result, url, rootId: rootId! };
+  }
+
+  /** 在云空间（默认「我的空间」根目录）创建 docx 文档并设置标题 */
+  private async createDriveDoc(title: string, folderToken?: string): Promise<{ docId: string; url: string }> {
+    const response = await this.tokens.withToken((accessToken) =>
+      this.client.postJson<{ document?: { document_id?: string } }>(
+        openApiUrl("/docx/v1/documents", { folder_token: folderToken || undefined }),
+        accessToken,
+        {},
+      ));
+    const docId = response.document?.document_id;
+    if (!docId) {
+      throw new Error("飞书创建文档响应缺少 document_id");
+    }
+    // 创建接口不能带标题：创建后 PATCH 标题
+    try {
+      await this.tokens.withToken((accessToken) =>
+        this.client.patchJson(
+          openApiUrl(`/docx/v1/documents/${encodeURIComponent(docId)}`),
+          accessToken,
+          { title },
+        ));
+    } catch {
+      // 标题设置失败不阻断创建（文档仍可用，标题可在飞书里改）
+    }
+    return { docId, url: buildRemoteUrl(undefined, "docx", docId) };
+  }
+
+  /** OAuth scope 按词精确匹配预检（缺失时抛带补救指引的错误；飞书可能同时授出只读子集，不能用 includes） */
+  private requireScope(scope: string, action: string): void {
+    const granted = new Set((this.getConfig().userToken?.scope ?? "").split(/\s+/));
+    if (!granted.has(scope)) {
+      throw new Error(
+        `${action}需要「${scope}」权限。请到「设置」页重新扫码授权（授权会自动申请该权限）；`
+        + `若仍未授予，需先在飞书开放平台为应用开通该权限并发布版本。`,
+      );
+    }
+  }
+
+  /**
+   * 把在线搜索命中的文档拉取到本地：注册到「在线搜索」文档源下（已入索引则直接复用），
+   * 再走常规 syncDoc（下载资源、生成 markdown、写回写基线）。
+   */
+  async pullOnlineDoc(hit: {
+    token: string;
+    entityType: "DOC" | "WIKI";
+    url?: string;
+    title?: string;
+  }): Promise<SyncDocResult> {
+    const existing = this.store.getNode(hit.token);
+    if (existing?.docId) {
+      return this.syncDoc(existing.token);
+    }
+
+    const rootId = this.ensureVirtualRoot(ONLINE_SEARCH_ROOT_ID, "在线搜索");
+    let node: NodeEntry;
+
+    if (hit.entityType === "WIKI") {
+      const resolved = await this.tokens.withToken((accessToken) =>
+        resolveWikiNode(this.client, accessToken, hit.token));
+      if (!resolved?.objToken) {
+        throw new Error(`无法解析 wiki 节点 ${hit.token}（可能已被删除、无权限，或不是知识库节点）`);
+      }
+      if (resolved.objType && !SYNCABLE_OBJ_TYPES.has(resolved.objType)) {
+        throw new Error(`该搜索结果是 ${resolved.objType}，暂不支持同步为 markdown（仅支持 docx 文档）`);
+      }
+      node = {
+        token: hit.token,
+        kind: "doc",
+        rootId,
+        parentToken: ONLINE_SEARCH_ROOT_ID,
+        title: resolved.title || hit.title || hit.token,
+        objType: resolved.objType || "docx",
+        hasChild: false,
+        docId: resolved.objToken,
+        remoteUrl: hit.url,
+      };
+    } else {
+      node = {
+        token: hit.token,
+        kind: "doc",
+        rootId,
+        parentToken: ONLINE_SEARCH_ROOT_ID,
+        title: hit.title || hit.token,
+        objType: "docx",
+        hasChild: false,
+        docId: hit.token,
+        remoteUrl: hit.url,
+      };
+    }
+
+    this.store.upsertNode(node);
+    this.store.save();
+    return this.syncDoc(node.token);
   }
 
   // ---------- 添加根 ----------

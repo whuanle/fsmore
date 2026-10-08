@@ -573,6 +573,49 @@ export function createApiRouter(ctx: AppContext): Router {  const router = expre
     return { hits: searchDocTitles(ctx.store, query) };
   }));
 
+  // ---------- 在线搜索（飞书云端，含未同步文档） ----------
+
+  router.post("/search/online", guard(async (req) => {
+    const missing = requireCredentials();
+    if (missing) {
+      throw new Error(missing);
+    }
+    const body = (req.body ?? {}) as { query?: string; limit?: number };
+    const query = body.query?.trim();
+    if (!query) {
+      throw new Error("缺少 query");
+    }
+    const result = await ctx.engine.searchOnline({
+      query,
+      pageSize: typeof body.limit === "number" ? Math.max(1, Math.min(20, Math.floor(body.limit))) : 10,
+    });
+    const hits = result.hits.map((hit) => {
+      const node = ctx.store.getNode(hit.token);
+      return { ...hit, synced: !!node?.mdPath, md_path: node?.mdPath };
+    });
+    return { total: result.total, has_more: result.has_more, hits };
+  }));
+
+  /** 把一条在线搜索命中拉取到本地（注册进「在线搜索」文档源并同步） */
+  router.post("/search/online/pull", guard(async (req) => {
+    const missing = requireCredentials();
+    if (missing) {
+      throw new Error(missing);
+    }
+    const body = (req.body ?? {}) as { token?: string; entity_type?: string; url?: string; title?: string };
+    const token = body.token?.trim();
+    if (!token) {
+      throw new Error("缺少 token");
+    }
+    const result = await ctx.engine.pullOnlineDoc({
+      token,
+      entityType: body.entity_type === "WIKI" ? "WIKI" : "DOC",
+      url: body.url,
+      title: body.title,
+    });
+    return { result, node: ctx.store.getNode(token) };
+  }));
+
   // ---------- 资源 ----------
 
   /** 保存画板裁边图（前端 canvas 裁掉飞书导出图四周空白后回存，<token>.trimmed.png；避免大 dataURL 塞进 iframe srcdoc） */

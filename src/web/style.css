@@ -315,6 +315,27 @@ input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(51, 112, 
   background: #f2f3f5; border-radius: 999px; padding: 1px 8px;
 }
 
+/* ---------- 在线搜索（云端结果区） ---------- */
+
+.online-section { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 6px; }
+.online-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 0 8px 2px;
+}
+.online-hint { padding: 4px 8px 6px; }
+.online-error { padding: 4px 8px 6px; color: var(--red, #c54040); }
+.online-row .node-icon { margin-top: 2px; }
+.online-summary {
+  margin-top: 1px; font-size: 11px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.online-badge {
+  flex-shrink: 0; margin: 2px 0 0 6px; font-size: 11px;
+  border-radius: 999px; padding: 1px 8px; background: #eef4ff; color: var(--primary);
+}
+.online-badge.ok { background: #e8f7ee; color: #1a7f4b; }
+.online-badge.mute { background: #f2f3f5; color: var(--text-3); }
+
 /* ---------- 表格 ---------- */
 
 .table-card { padding: 0; overflow: hidden; }

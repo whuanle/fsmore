@@ -91,6 +91,7 @@ function formatTime(iso) {
 }
 
 function iconFor(node) {
+  if (node.objType === "search") return "🌐";
   if (node.kind === "folder") return "📁";
   if (node.kind === "space") return "📚";
   if (node.kind === "doc") return "📄";
@@ -117,7 +118,10 @@ const state = {
   viewerPath: null,
   viewerNode: null,
   autoHealedBoards: null, // 已自动补拉过画板的文档 token（每个文档一次，防循环）
-  search: { query: "", hits: null, loading: false, error: null }, // 文档标题搜索（左目录）
+  search: {
+    query: "", hits: null, loading: false, error: null, // 文档标题搜索（左目录）
+    online: { loading: false, error: null, hits: null, total: 0 }, // 飞书云端搜索
+  },
 };
 
 // ---------- 视图切换 ----------
@@ -341,7 +345,7 @@ function renderTree() {
       kind: root.kind === "wiki_space" ? "space" : root.kind === "folder" ? "folder" : root.kind === "doc" ? "doc" : "wiki",
       title: root.title,
       hasChild: root.kind !== "doc",
-      objType: root.kind === "doc" ? "docx" : undefined,
+      objType: root.kind === "doc" ? "docx" : root.kind === "search" ? "search" : undefined,
       mdPath: null,
       rootId: root.id,
     };
@@ -375,7 +379,10 @@ docSearchClear.addEventListener("click", () => {
 });
 
 function clearDocSearch() {
-  state.search = { query: "", hits: null, loading: false, error: null };
+  state.search = {
+    query: "", hits: null, loading: false, error: null,
+    online: { loading: false, error: null, hits: null, total: 0 },
+  };
   docSearchClear.classList.add("hidden");
   renderTree();
 }
@@ -405,31 +412,142 @@ function renderSearchResults(tree) {
   const search = state.search;
   if (search.loading) {
     tree.append(el("div", { class: "tree-empty" }, "搜索中…"));
+    renderOnlineSection(tree);
     return;
   }
   if (search.error) {
     tree.append(el("div", { class: "tree-empty" }, `搜索失败：${search.error}`));
+    renderOnlineSection(tree);
     return;
   }
   if (!search.hits || search.hits.length === 0) {
     tree.append(el("div", { class: "tree-empty" }, "没有匹配的文档"));
+  } else {
+    tree.append(el("div", { class: "search-count" }, `${search.hits.length} 篇匹配文档`));
+    for (const hit of search.hits) {
+      const breadcrumb = (hit.path ?? []).slice(0, -1).join(" / ");
+      tree.append(el("div", {
+        class: "tree-row search-row",
+        title: breadcrumb ? `${hit.title}\n${breadcrumb}` : hit.title,
+        onclick: () => void openSearchHit(hit),
+      },
+        el("span", { class: "node-icon" }, iconFor({ kind: "doc", objType: hit.objType })),
+        el("div", { class: "search-row-main" },
+          el("div", { class: "search-row-title" }, hit.title),
+          breadcrumb ? el("div", { class: "search-row-path" }, breadcrumb) : null,
+        ),
+        hit.synced ? null : el("span", { class: "search-unsynced", title: "尚未同步，点击时自动拉取" }, "未同步"),
+      ));
+    }
+  }
+  renderOnlineSection(tree);
+}
+
+// ---------- 在线搜索（飞书云端，含未同步文档；命中后拉取到本地） ----------
+
+/** 搜索结果下方常驻的「在线搜索」区：本地没找到时到飞书云端搜并拉取 */
+function renderOnlineSection(tree) {
+  const search = state.search;
+  const online = search.online;
+  const section = el("div", { class: "online-section" });
+  const action = online.hits || online.loading || online.error
+    ? null
+    : el("button", {
+        class: "btn-link",
+        type: "button",
+        title: "搜索授权用户可见的全部飞书云文档与知识库（不限于已添加的文档源），命中后可拉取到本地",
+        onclick: () => void runOnlineSearch(),
+      }, `在飞书云端搜「${search.query}」`);
+  section.append(el("div", { class: "online-head" }, el("span", { class: "section-label" }, "☁ 在线搜索"), action));
+
+  if (online.loading) {
+    section.append(el("div", { class: "tree-empty online-hint" }, "正在搜索飞书云端…"));
+  } else if (online.error) {
+    section.append(el("div", { class: "tree-empty online-error" }, `在线搜索失败：${online.error}`));
+  } else if (online.hits) {
+    if (online.hits.length === 0) {
+      section.append(el("div", { class: "tree-empty online-hint" }, "云端没有匹配结果"));
+    } else {
+      section.append(el("div", { class: "search-count" }, `云端 ${online.total || online.hits.length} 条结果`));
+      for (const hit of online.hits) {
+        section.append(onlineHitRow(hit));
+      }
+    }
+  } else {
+    section.append(el("div", { class: "tree-empty online-hint" }, "本地没有时搜飞书云端（含未同步文档），点击即可拉取"));
+  }
+  tree.append(section);
+}
+
+function onlineHitRow(hit) {
+  const type = String(hit.doc_types?.[0] ?? hit.entity_type ?? "").toUpperCase();
+  const meta = [
+    hit.owner_name,
+    hit.update_time ? formatTime(hit.update_time) : null,
+    type,
+  ].filter(Boolean).join(" · ");
+  const badge = hit.synced
+    ? el("span", { class: "online-badge ok", title: hit.md_path || "已在本地" }, "已同步")
+    : hit.syncable
+      ? el("span", { class: "online-badge", title: "点击拉取到本地" }, "拉取")
+      : el("span", { class: "online-badge mute", title: "该类型暂不支持同步为 markdown" }, "不支持");
+  return el("div", {
+    class: "tree-row search-row online-row",
+    title: hit.url ? `${hit.title}\n${hit.url}` : hit.title,
+    onclick: () => void openOnlineHit(hit),
+  },
+    el("span", { class: "node-icon" }, hit.entity_type === "WIKI" ? "🗂️" : "📄"),
+    el("div", { class: "search-row-main" },
+      el("div", { class: "search-row-title" }, hit.title),
+      meta ? el("div", { class: "search-row-path" }, meta) : null,
+      hit.summary ? el("div", { class: "online-summary", title: hit.summary }, hit.summary) : null,
+    ),
+    badge,
+  );
+}
+
+async function runOnlineSearch() {
+  const query = state.search.query;
+  if (!query) {
     return;
   }
-  tree.append(el("div", { class: "search-count" }, `${search.hits.length} 篇匹配文档`));
-  for (const hit of search.hits) {
-    const breadcrumb = (hit.path ?? []).slice(0, -1).join(" / ");
-    tree.append(el("div", {
-      class: "tree-row search-row",
-      title: breadcrumb ? `${hit.title}\n${breadcrumb}` : hit.title,
-      onclick: () => void openSearchHit(hit),
-    },
-      el("span", { class: "node-icon" }, iconFor({ kind: "doc", objType: hit.objType })),
-      el("div", { class: "search-row-main" },
-        el("div", { class: "search-row-title" }, hit.title),
-        breadcrumb ? el("div", { class: "search-row-path" }, breadcrumb) : null,
-      ),
-      hit.synced ? null : el("span", { class: "search-unsynced", title: "尚未同步，点击时自动拉取" }, "未同步"),
-    ));
+  state.search.online = { loading: true, error: null, hits: null, total: 0 };
+  renderTree();
+  try {
+    const data = await api("/api/search/online", { method: "POST", body: { query, limit: 15 } });
+    if (state.search.query !== query) return; // 输入已变化：丢弃过期结果
+    state.search.online = { loading: false, error: null, hits: data.hits ?? [], total: data.total ?? 0 };
+  } catch (error) {
+    if (state.search.query !== query) return;
+    state.search.online = { loading: false, error: error.message, hits: [], total: 0 };
+  }
+  renderTree();
+}
+
+/** 点击云端结果：已同步直接打开；未同步先拉取（注册进「在线搜索」文档源）再打开 */
+async function openOnlineHit(hit) {
+  if (hit.synced && hit.md_path) {
+    docSearchInput.value = "";
+    clearDocSearch();
+    await selectDoc({ token: hit.token, kind: "doc", title: hit.title, mdPath: hit.md_path });
+    return;
+  }
+  if (!hit.syncable) {
+    toast("该类型暂不支持同步为 markdown（仅 docx 文档与 wiki 节点）", "error");
+    return;
+  }
+  try {
+    toast(`正在拉取「${hit.title}」…`, "info", 2500);
+    const data = await api("/api/search/online/pull", {
+      method: "POST",
+      body: { token: hit.token, entity_type: hit.entity_type, url: hit.url, title: hit.title },
+    });
+    docSearchInput.value = "";
+    clearDocSearch();
+    await Promise.all([refreshRoots(), refreshStatus()]);
+    await selectDoc({ token: hit.token, kind: "doc", title: data.result.title, mdPath: data.result.mdPath });
+  } catch (error) {
+    toast(`拉取失败：${error.message}`, "error", 6000);
   }
 }
 

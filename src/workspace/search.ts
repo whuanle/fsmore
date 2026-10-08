@@ -61,6 +61,108 @@ export function searchDocTitles(store: WorkspaceStore, query: string, limit = 50
     .slice(0, limit);
 }
 
+// ---------- 批量解析文档本地位置（MCP resolve_docs） ----------
+
+export type ResolvedDocLocation = {
+  input_type: "token" | "title";
+  input: string;
+  found: boolean;
+  /** token 命中的唯一节点（input_type=token 时） */
+  match?: {
+    token: string;
+    title: string;
+    kind: NodeEntry["kind"];
+    obj_type?: string;
+    md_path?: string;
+    synced: boolean;
+    doc_id?: string;
+    source_url?: string;
+  };
+  /** 标题命中的候选（input_type=title 时，精确匹配优先，最多 5 个） */
+  matches?: Array<NonNullable<ResolvedDocLocation["match"]>>;
+  note?: string;
+};
+
+function toLocation(node: NodeEntry): NonNullable<ResolvedDocLocation["match"]> {
+  return {
+    token: node.token,
+    title: node.title,
+    kind: node.kind,
+    obj_type: node.objType,
+    md_path: node.mdPath,
+    synced: !!node.mdPath,
+    doc_id: node.docId,
+    source_url: node.remoteUrl,
+  };
+}
+
+/**
+ * 批量解析文档的本地位置：
+ * - tokens：节点 token 或内容 doc_id 逐个精确反查索引
+ * - titles：按标题匹配（精确优先，其次包含），返回候选列表
+ * 只查索引不触发网络；未同步的会带提示（AI 可接着 sync_doc / search_online）。
+ */
+export function resolveDocLocations(
+  store: WorkspaceStore,
+  input: { tokens?: string[]; titles?: string[] },
+): ResolvedDocLocation[] {
+  const results: ResolvedDocLocation[] = [];
+
+  for (const raw of input.tokens ?? []) {
+    const token = raw.trim();
+    if (!token) {
+      continue;
+    }
+    const node = store.getNode(token)
+      ?? Object.values(store.nodes).find((item) => item.docId === token);
+    if (!node) {
+      results.push({
+        input_type: "token",
+        input: token,
+        found: false,
+        note: "不在本地索引：可用 search_online 搜索并拉取，或 get_tree 查看已添加文档源",
+      });
+      continue;
+    }
+    const location = toLocation(node);
+    results.push({
+      input_type: "token",
+      input: token,
+      found: true,
+      match: location,
+      note: location.synced ? undefined : "已在索引但未同步：先 sync_doc 拉取后再 read_doc",
+    });
+  }
+
+  for (const raw of input.titles ?? []) {
+    const title = raw.trim();
+    if (!title) {
+      continue;
+    }
+    const lowered = title.toLowerCase();
+    const docs = Object.values(store.nodes).filter((node) => node.kind === "doc" && node.docId);
+    const exact = docs.filter((node) => node.title.toLowerCase() === lowered);
+    const partial = exact.length > 0
+      ? []
+      : docs.filter((node) => node.title.toLowerCase().includes(lowered));
+    const matches = [...exact, ...partial]
+      .sort((a, b) => a.title.localeCompare(b.title, "zh"))
+      .slice(0, 5)
+      .map(toLocation);
+    results.push({
+      input_type: "title",
+      input: title,
+      found: matches.length > 0,
+      matches,
+      note: matches.length === 0
+        ? "本地索引无此标题：可用 search_online 到飞书云端搜索"
+        : matches.length > 1 ? "多个候选，按 title 确认后用对应 token" : undefined,
+    });
+  }
+
+  return results;
+}
+
 export function searchDocs(store: WorkspaceStore, query: string, limit = 20): SearchHit[] {
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) {

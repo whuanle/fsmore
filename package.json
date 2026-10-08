@@ -1,6 +1,6 @@
 {
   "name": "@whuanle/fsmore",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "description": "飞书本地 AI 工作台：飞书文档同步为本地 Markdown + Web 可视化管理 + MCP 服务",
   "keywords": [
     "feishu",

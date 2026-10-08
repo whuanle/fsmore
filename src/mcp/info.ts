@@ -3,6 +3,11 @@
 export const MCP_ENDPOINT = "/mcp";
 
 export const MCP_TOOLS_INFO: Array<{ name: string; description: string }> = [
+  { name: "search_online", description: "在飞书云端搜索文档（授权用户可见的全部云文档与知识库，不限已同步范围），命中后自动拉取到本地并返回路径；支持按编辑/创建/打开时间排序" },
+  { name: "get_tree", description: "获取文档层级目录树：全部文档源 / 指定文档源 / 指定节点位置展开，含同步状态与本地路径" },
+  { name: "resolve_docs", description: "批量解析文档本地位置：一组 token/doc_id 精确反查或标题模糊匹配，返回 md 路径与同步状态" },
+  { name: "create_doc", description: "新建飞书 docx 文档并同步到本地（我的空间 / 云空间文件夹 / wiki 节点下），编辑后 push_doc 回写" },
+  { name: "add_root", description: "把知识库节点 / 云空间文件夹 / 单篇文档添加为文档源并列出目录树，配合 sync_space 批量同步" },
   { name: "list_spaces", description: "列出已添加的飞书文档源与本地 markdown 工作区路径" },
   { name: "list_docs", description: "列出已同步的文档（路径/标题/token/同步时间/版本），支持按源与关键词过滤" },
   { name: "search_docs", description: "在本地全部 markdown 中做关键词全文搜索，返回得分与摘要" },
